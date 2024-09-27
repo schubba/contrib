@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+=head1 NAME
+
+podman_ - Podman wildcard-plugin to monitor a L<Podman|https://podman.io> host.
+
+This wildcard plugin provides series C<containers>, C<images>, C<status>,
+C<volumes>, C<cpu>, C<memory> and C<network> as separate graphs. It also
+supports a C<multi> suffix that provides all of those as a multigraph.
+
+=head1 INSTALLATION
+
+- Copy this plugin in your munin plugins directory
+- Install Python3 "podman" package
+
+=over 2
+
+If you want all the graphs as a multigraph, create a single multi symlink.
+
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_multi
+
+Or choose a subset of those you want.
+
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_containers
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_cpu
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_images
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_memory
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_network
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_size
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_status
+    ln -s /usr/share/munin/plugins/podman_ /etc/munin/plugins/podman_volumes
+
+=back
+
+After the installation you need to restart your munin-node:
+
+=over 2
+
+    systemctl restart munin-node
+
+=back
+
+=head1 CONFIGURATION
+
+This plugin should run under a specific user (e.g., "container"), and you need to create a file named podman placed in the directory /etc/munin/plugin-conf.d/ with the following config:
+
+=over 2
+
+    [podman_*]
+    user container
+    env.PODMAN_HOST unix://run/user/1000/podman/podman.sock
+    env.EXCLUDE_CONTAINER_NAME regexp
+
+=back
+
+You may need to adjust the path depending on your setup.
+
+=head1 MAGIC MARKERS
+
+ #%# family=auto
+ #%# capabilities=autoconf suggest multigraph
+
+=cut
+"""
+
+import os
+import sys
+import re
+try:
+    from functools import cached_property
+except ImportError:
+    # If cached_property is not available, use property decorator without caching
+    cached_property = property
+from multiprocessing import Process, Queue
+
+
+def sorted_by_creation_date(func):
+    def sorted_func(*args, **kwargs):
+        return sorted(
+            func(*args, **kwargs),
+            key=(
+                lambda x: x.attrs['CreatedAt']
+                if 'CreatedAt' in x.attrs
+                else x.attrs['Created']
+            )
+        )
+    return sorted_func
+
+
+def clean_fieldname(text):
+    if text == "root":
+        return "_root"
+    else:
+        return re.sub(r"(^[^A-Za-z_]|[^A-Za-z0-9_])", "_", text)
+
+
+class ClientWrapper:
+    """
+    A small wrapper for the podman client, to centralize some parsing logic,
+    and support caching.
+    """
+    client = None
+    exclude = None
+
+    def __init__(self, client, exclude_re=None):
+        self.client = client
+        if exclude_re:
+            self.exclude = re.compile(exclude_re)
+
+    @cached_property
+    @sorted_by_creation_date
+    def all_containers(self):
+        return [
+            c for c in self.client.containers.list(all=True)
+            if (c.status == 'running') and (not self.exclude or not self.exclude.search(c.name))
+        ]
+
+    @cached_property
+    @sorted_by_creation_date
+    def all_images(self):
+        return self.client.images.list(all=True)
+
+    @cached_property
+    @sorted_by_creation_date
+    def volumes(self):
+        return self.client.volumes.list()
+
+
+def container_summary(container, *args):
+    summary = container.name
+    attributes = container_attributes(container, *args)
+    if attributes:
+        summary += f' ({attributes})'
+    return summary
+
+
+def container_attributes(container, *args):
+    attributes = container.image.tags
+    attributes.append(container.attrs['Created'])
+    return ', '.join(attributes + list(args))
+
+
+def print_containers_status(client):
+    running = []
+    unhealthy = []
+    paused = []
+    created = []
+    restarting = []
+    removing = []
+    exited = []
+    dead = []
+    for container in client.all_containers:
+        if container.status == 'running':
+            state = client.client.inspect(container.name)['State']
+            if state.get('Health', {}).get('Status') == 'unhealthy':
+                unhealthy.append(container)
+            else:
+                running.append(container)
+        elif container.status == 'paused':
+            paused.append(container)
+        elif container.status == 'created':
+            created.append(container)
+        elif container.status == 'restarting':
+            restarting.append(container)
+        elif container.status == 'removing':
+            removing.append(container)
+        elif container.status == 'exited':
+            exited.append(container)
+        elif container.status == 'dead':
+            dead.append(container)
+    print('running.value', len(running))
+    print('unhealthy.value', len(unhealthy))
+    print('paused.value', len(paused))
+    print('created.value', len(created))
+    print('restarting.value', len(restarting))
+    print('removing.value', len(removing))
+    print('exited.value', len(exited))
+    print('dead.value', len(dead))
+
+
+def image_summary(image):
+    attributes = image.tags
+    attributes.append(image.attrs['Created'])
+    attributes.append(f"{round(image.attrs['Size']/1024**2, 2)} MiB")
+    return f"{image.short_id} ({', '.join(attributes)})"
+
+
+def print_images_count(client):
+    images = client.all_images
+    print('images_quantity.value', len(images))
+    print('images_quantity.extinfo', ', '.join(image_summary(i) for i in images))
+
+
+def main():
+    series = [
+        'containers',
+        'cpu',
+        'images',
+        'memory',
+        'network',
+        'status',
+        'size',
+        'volumes',
+    ]
+
+    try:
+        mode = sys.argv[1]
+    except IndexError:
+        mode = ""
+    wildcard = sys.argv[0].split("podman_")[1].split("_")[0]
+
+    try:
+        from podman import PodmanClient
+        client = PodmanClient(base_url="unix://run/user/1000/podman/podman.sock")  # Adjust this path as needed
+        if mode == "autoconf":
+            client.ping()
+            print('yes')
+            sys.exit(0)
+    except Exception as e:
+        print(f'no ({e})')
+        if mode == "autoconf":
+            sys.exit(0)
+        sys.exit(1)
+
+    if mode == "suggest":
+        print("multi")
+        sys.exit(0)
+
+    client = ClientWrapper(client, exclude_re=os.getenv('EXCLUDE_CONTAINER_NAME'))
+
+    if wildcard in series:
+        globals()[wildcard](client, mode)
+    elif wildcard == 'multi':
+        for s in series:
+            print(f'multigraph podman_{s}')
+            globals()[s](client, mode)
+    else:
+        print(f'unknown series ({wildcard})', file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+
